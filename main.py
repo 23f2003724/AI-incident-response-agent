@@ -29,13 +29,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Model fallback list — try in order until one works
+# Model fallback list — try in order until one works (updated for July 2026)
 GEMINI_MODEL_FALLBACKS = [
     os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite-preview-06-17",
     "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
 ]
 
 # ---------------------------------------------------------------------------
@@ -1070,4 +1071,17 @@ async def health():
 @app.get("/health")
 async def healthz():
     return {"status": "ok"}
+
+
+@app.get("/debug/models")
+async def list_models():
+    """Debug endpoint to list available Gemini models."""
+    if not GEMINI_API_KEY:
+        return {"error": "GEMINI_API_KEY not set"}
+    try:
+        models = [m.name for m in genai.list_models()
+                  if "generateContent" in m.supported_generation_methods]
+        return {"available_models": models}
+    except Exception as e:
+        return {"error": str(e)}
 
