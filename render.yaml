@@ -2,11 +2,12 @@ services:
   - type: web
     name: incident-response-agent
     runtime: python
+    pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GEMINI_API_KEY
-        sync: false          # set manually in Render dashboard
+        sync: false
       - key: GEMINI_MODEL
         value: gemini-1.5-flash
     healthCheckPath: /health
