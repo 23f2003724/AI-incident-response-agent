@@ -69,69 +69,74 @@ def strip_priv(d: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Gemini call — fast model, no thinking, JSON mode, 12s timeout
+# Gemini call — parallel race, 14s total budget
 # ---------------------------------------------------------------------------
 
 def call_model(incident: dict, catalog: list, policy: dict) -> dict:
-    allowed   = incident.get("allowedRootCauses", [])
-    title     = incident.get("title", "")
-    service   = incident.get("service", "")
-    severity  = incident.get("severity", "")
-    transcript= incident.get("transcript", "")
-    max_diag  = policy.get("maximumDiagnostics", 3)
-    effect_names = set(policy.get("effectTools", []))
+    import concurrent.futures
 
-    diag_tools = [t for t in catalog if t["name"] not in effect_names]
+    allowed      = incident.get("allowedRootCauses", [])
+    title        = incident.get("title", "")
+    service      = incident.get("service", "")
+    severity     = incident.get("severity", "")
+    transcript   = incident.get("transcript", "")
+    max_diag     = policy.get("maximumDiagnostics", 3)
+    effect_names = set(policy.get("effectTools", []))
+    diag_tools   = [t for t in catalog if t["name"] not in effect_names]
 
     prompt = (
-        "You are an incident response AI. Analyze this incident and respond with ONLY "
-        "a JSON object (no markdown fences).\n\n"
+        "You are an incident response AI. Respond with ONLY a JSON object (no markdown).\n\n"
         f"Allowed root causes: {json.dumps(allowed)}\n"
         f"Title: {title}\nService: {service}\nSeverity: {severity}\n\n"
-        f"Transcript (evidence IDs in [brackets]):\n{transcript[:6000]}\n\n"
-        f"Diagnostic tools available:\n{json.dumps(diag_tools, separators=(',',':'))[:2000]}\n\n"
-        f"Rules:\n"
-        f"- Pick exactly ONE rootCause from the allowed list\n"
-        f"- Cite exactly 2-4 evidence IDs that support it\n"
-        f"- Pick 1 to {max_diag} diagnostic tools (only directly relevant ones)\n"
-        f"- For each diagnostic, supply exact incident-specific arguments\n"
-        f"- Each diagnostic must cite at least one of your chosen evidence IDs\n\n"
-        "JSON shape:\n"
-        '{"rootCause":"...","evidence":["ev_...","ev_..."],'
+        f"Transcript:\n{transcript[:5000]}\n\n"
+        f"Diagnostic tools:\n{json.dumps(diag_tools, separators=(',',':'))[:1500]}\n\n"
+        f"Rules: pick ONE rootCause, cite 2-4 evidence IDs, choose 1-{max_diag} diagnostics.\n"
+        'JSON: {"rootCause":"...","evidence":["ev_...","ev_..."],'
         '"diagnostics":[{"toolName":"...","arguments":{...},"evidence":["ev_..."]}]}'
     )
+    cfg = genai.types.GenerationConfig(temperature=0.0, max_output_tokens=800)
 
-    cfg = genai.types.GenerationConfig(
-        temperature=0.0,
-        max_output_tokens=1024,
-    )
+    def try_one(name: str):
+        m = genai.GenerativeModel(name)
+        r = m.generate_content(prompt, generation_config=cfg,
+                               request_options={"timeout": 14})
+        txt = r.text.strip()
+        if txt.startswith("```"):
+            lines = txt.splitlines()
+            txt = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+        res = json.loads(txt.strip())
+        res["_model"] = name
+        return res
 
-    last_err = None
-    for model_name in MODELS:
-        try:
-            m = genai.GenerativeModel(model_name)
-            resp = m.generate_content(prompt, generation_config=cfg,
-                                      request_options={"timeout": 12})
-            text = resp.text.strip()
-            # strip fences
-            if text.startswith("```"):
-                lines = text.splitlines()
-                text = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
-            result = json.loads(text.strip())
-            result["_model"] = model_name
-            break
-        except Exception as e:
-            last_err = e
-            continue
-    else:
-        raise RuntimeError(f"All models failed. Last: {last_err}")
+    # Try primary first (most likely to work, avoids racing unnecessarily)
+    primary = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+    try:
+        result = try_one(primary)
+    except Exception:
+        # Race all others in parallel; take first success
+        others = [m for m in MODELS if m != primary]
+        result = None
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(others)) as ex:
+            futs = {ex.submit(try_one, m): m for m in others}
+            try:
+                for f in concurrent.futures.as_completed(futs, timeout=13):
+                    try:
+                        result = f.result()
+                        break
+                    except Exception:
+                        continue
+            except concurrent.futures.TimeoutError:
+                pass
+        if result is None:
+            raise RuntimeError("All Gemini models timed out or failed")
 
-    # Sanitise
+    # Sanitise output
     if result.get("rootCause") not in allowed:
         result["rootCause"] = allowed[0] if allowed else "unknown"
     ev = result.get("evidence", [])
-    if len(ev) < 2: ev += [ev[0]] * (2 - len(ev)) if ev else ["ev_unknown", "ev_unknown"]
-    result["evidence"] = list(dict.fromkeys(ev))[:4]   # dedup, max 4
+    if len(ev) < 2:
+        ev = (ev + ["ev_unknown","ev_unknown"])[:2]
+    result["evidence"] = list(dict.fromkeys(ev))[:4]
     result["diagnostics"] = result.get("diagnostics", [])[:max_diag]
     return result
 
