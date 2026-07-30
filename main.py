@@ -29,6 +29,15 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
+# Model fallback list — try in order until one works
+GEMINI_MODEL_FALLBACKS = [
+    os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-latest",
+]
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -93,11 +102,8 @@ def _new_approval_id() -> str:
 
 def _call_gemini(incident: dict, tool_catalog: list, policy: dict) -> dict:
     """
-    Ask Gemini to:
-      1. Choose rootCause from allowedRootCauses
-      2. Cite 2-4 evidence IDs
-      3. Choose 1-3 diagnostic tool calls (name + arguments + evidence)
-    Returns dict with keys: rootCause, evidence, diagnostics
+    Ask Gemini to choose rootCause, cite evidence, and pick diagnostic tools.
+    Tries model fallbacks if primary model is unavailable.
     """
     model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
@@ -144,11 +150,25 @@ Respond with ONLY valid JSON in this exact shape (no markdown):
   ]
 }}"""
 
-    model = genai.GenerativeModel(model_name)
-    response = model.generate_content(
-        prompt,
-        generation_config={"response_mime_type": "application/json"},
-    )
+    last_err = None
+    response = None
+    used_model = model_name
+    for try_model in [model_name] + [m for m in GEMINI_MODEL_FALLBACKS if m != model_name]:
+        try:
+            m = genai.GenerativeModel(try_model)
+            response = m.generate_content(
+                prompt,
+                generation_config={"response_mime_type": "application/json"},
+            )
+            used_model = try_model
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if response is None:
+        raise last_err
+
     text = response.text.strip()
     # Strip markdown code fences if present
     if text.startswith("```"):
@@ -170,6 +190,7 @@ Respond with ONLY valid JSON in this exact shape (no markdown):
 
     # Clamp diagnostics
     result["diagnostics"] = result.get("diagnostics", [])[:max_diag]
+    result["_used_model"] = used_model
     return result
 
 
@@ -602,7 +623,7 @@ async def create_incident(request: Request):
         "_server_span_id": server_span_id,
         "_agent_span_id": agent_span_id,
         "_chat_span_id": chat_span_id,
-        "_model_name": model_name,
+        "_model_name": plan.get("_used_model", model_name),
         "_incoming_traceparent": incoming_tp,
         "_incoming_tracestate": incoming_ts,
         "_pending_actions": {
