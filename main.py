@@ -99,7 +99,7 @@ def _call_gemini(incident: dict, tool_catalog: list, policy: dict) -> dict:
       3. Choose 1-3 diagnostic tool calls (name + arguments + evidence)
     Returns dict with keys: rootCause, evidence, diagnostics
     """
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
     allowed = incident.get("allowedRootCauses", [])
     transcript = incident.get("transcript", "")
@@ -145,14 +145,17 @@ Respond with ONLY valid JSON in this exact shape (no markdown):
 }}"""
 
     model = genai.GenerativeModel(model_name)
-    response = model.generate_content(prompt)
+    response = model.generate_content(
+        prompt,
+        generation_config={"response_mime_type": "application/json"},
+    )
     text = response.text.strip()
     # Strip markdown code fences if present
     if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    text = text.strip()
+        lines = text.split("\n")
+        # remove first and last fence lines
+        inner = lines[1:-1] if lines[-1].startswith("```") else lines[1:]
+        text = "\n".join(inner).strip()
     result = json.loads(text)
 
     # Validate rootCause
@@ -263,7 +266,7 @@ def build_otlp_trace(state: dict) -> dict:
 
     # --- CLIENT chat incident-plan span ---
     chat_span_id = state.get("_chat_span_id", _new_span_id())
-    model_name = state.get("_model_name", os.environ.get("GEMINI_MODEL", "gemini-1.5-flash"))
+    model_name = state.get("_model_name", os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
     chat_span = {
         "traceId": trace_id,
         "spanId": chat_span_id,
@@ -286,11 +289,19 @@ def build_otlp_trace(state: dict) -> dict:
     receipt_log = state.get("receiptLog", [])
     tool_span_ids = {}  # actionId -> execute_tool span id (for join links)
 
+    # Build unique logical actions (first dispatch per actionId)
+    seen_action_ids = set()
+    unique_actions = []
     for dispatch in action_log:
+        aid = dispatch["actionId"]
+        if aid not in seen_action_ids:
+            seen_action_ids.add(aid)
+            unique_actions.append(dispatch)
+
+    for dispatch in unique_actions:
         action_id = dispatch["actionId"]
         call_id = dispatch["callId"]
         tool_name = dispatch["toolName"]
-        attempt = dispatch.get("attempt", 1)
 
         # Find all receipts for this action
         receipts_for_action = [
@@ -323,14 +334,22 @@ def build_otlp_trace(state: dict) -> dict:
         t += dt
 
         # CLIENT POST tool/<toolName> spans per attempt
-        # Each attempt is stored in action log separately (retries increment attempt)
+        # Retries are separate entries in action_log with same actionId, higher attempt
         attempts_for_action = [
             d for d in action_log
             if d.get("actionId") == action_id
         ]
+        seen_attempts = set()
         for disp in attempts_for_action:
             att = disp.get("attempt", 1)
-            client_span_id = disp.get("_client_span_id", _new_span_id())
+            if att in seen_attempts:
+                continue
+            seen_attempts.add(att)
+            # Look up stored client span ID
+            client_span_id = state.get(
+                f"_client_span_{action_id}_{att}",
+                _new_span_id()
+            )
             # Find receipt for this specific attempt
             rec = next(
                 (r for r in receipts_for_action if r.get("attempt") == att), None
@@ -502,7 +521,7 @@ async def create_incident(request: Request):
         incoming_tp = ""
         incoming_ts = ""
 
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
     # Call Gemini for planning
     try:
@@ -648,7 +667,7 @@ async def post_receipt(run_id: str, request: Request):
     receipt_hash = _content_hash(body)
 
     # 409 if same receiptId with changed content
-    if receipt_id in CONTENT_HASHES:
+    if f"receipt:{receipt_id}" in CONTENT_HASHES:
         if CONTENT_HASHES[f"receipt:{receipt_id}"] != receipt_hash:
             return JSONResponse(status_code=409, content={
                 "error": "conflict", "detail": "receiptId exists with different content"
