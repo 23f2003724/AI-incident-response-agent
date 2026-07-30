@@ -2,12 +2,15 @@
 TDS GA5 Q11 - AI Incident Response Agent
 FastAPI + Gemini API + OTLP Tracing
 """
-import os, json, hashlib, secrets, time
+import os, json, hashlib, secrets, time, logging, traceback, concurrent.futures
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 import google.generativeai as genai
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("agent")
 
 app = FastAPI(title="Incident Response Agent")
 
@@ -24,6 +27,8 @@ if GEMINI_API_KEY:
 # Fast, cheap models — tried in order. First that responds wins.
 # gemini-2.5-flash-lite is fastest; fallbacks in case env var is stale.
 _PRIMARY = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+if _PRIMARY.startswith("models/"):
+    _PRIMARY = _PRIMARY[len("models/"):]
 MODELS = list(dict.fromkeys([
     _PRIMARY,
     "gemini-2.5-flash-lite",
@@ -73,8 +78,6 @@ def strip_priv(d: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def call_model(incident: dict, catalog: list, policy: dict) -> dict:
-    import concurrent.futures
-
     allowed      = incident.get("allowedRootCauses", [])
     title        = incident.get("title", "")
     service      = incident.get("service", "")
@@ -98,8 +101,7 @@ def call_model(incident: dict, catalog: list, policy: dict) -> dict:
 
     def try_one(name: str):
         m = genai.GenerativeModel(name)
-        r = m.generate_content(prompt, generation_config=cfg,
-                               request_options={"timeout": 14})
+        r = m.generate_content(prompt, generation_config=cfg)
         txt = r.text.strip()
         if txt.startswith("```"):
             lines = txt.splitlines()
@@ -108,13 +110,12 @@ def call_model(incident: dict, catalog: list, policy: dict) -> dict:
         res["_model"] = name
         return res
 
-    # Try primary first (most likely to work, avoids racing unnecessarily)
-    primary = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
     try:
-        result = try_one(primary)
-    except Exception:
-        # Race all others in parallel; take first success
-        others = [m for m in MODELS if m != primary]
+        log.info(f"Trying model: {_PRIMARY}")
+        result = try_one(_PRIMARY)
+    except Exception as e:
+        log.warning(f"Primary {_PRIMARY} failed: {e}")
+        others = [m for m in MODELS if m != _PRIMARY]
         result = None
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(others)) as ex:
             futs = {ex.submit(try_one, m): m for m in others}
@@ -717,6 +718,16 @@ async def root():
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.get("/debug/env")
+async def debug_env():
+    return {
+        "GEMINI_MODEL_env": os.environ.get("GEMINI_MODEL","(not set)"),
+        "_PRIMARY": _PRIMARY,
+        "MODELS": MODELS,
+        "GEMINI_API_KEY_set": bool(GEMINI_API_KEY),
+        "store_runs": list(STORE.keys()),
+    }
 
 @app.get("/debug/models")
 async def list_models():
