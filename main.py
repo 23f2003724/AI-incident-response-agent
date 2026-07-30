@@ -2,490 +2,432 @@
 TDS GA5 Q11 - AI Incident Response Agent
 FastAPI + Gemini API + OTLP Tracing
 """
-import os
-import json
-import hashlib
-import secrets
-import time
-import uuid
-from copy import deepcopy
+import os, json, hashlib, secrets, time
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 import google.generativeai as genai
 
 app = FastAPI(title="Incident Response Agent")
 
 # ---------------------------------------------------------------------------
-# In-memory store  {runId -> state_dict}
+# Storage
 # ---------------------------------------------------------------------------
-STORE: Dict[str, dict] = {}
-# Content hashes for 409 detection  {runId -> hash, receiptId -> hash}
-CONTENT_HASHES: Dict[str, str] = {}
+STORE: Dict[str, dict] = {}          # runId -> state
+HASHES: Dict[str, str] = {}          # "incident:{runId}" | "receipt:{id}" -> sha256
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# Model fallback list — try in order until one works (updated for July 2026)
-GEMINI_MODEL_FALLBACKS = [
-    os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite-preview-06-17",
+# Fast, cheap models — tried in order. First that responds wins.
+# gemini-2.5-flash-lite is fastest; fallbacks in case env var is stale.
+_PRIMARY = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+MODELS = list(dict.fromkeys([
+    _PRIMARY,
     "gemini-2.5-flash-lite",
     "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-]
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+]))
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Low-level helpers
 # ---------------------------------------------------------------------------
 
-def _content_hash(obj: Any) -> str:
+def _sha(obj: Any) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()
+
+def _hex(n=8) -> str:
+    while True:
+        v = secrets.token_hex(n)
+        if v != "0"*(n*2): return v
+
+def span_id()  -> str: return _hex(8)
+def trace_id() -> str: return _hex(16)
+def act_id()   -> str: return "act_" + _hex(8)
+def call_id()  -> str: return "call_" + _hex(8)
+def appr_id()  -> str: return "appr_" + _hex(8)
+
+def tp(trace: str, span: str) -> str:
+    return f"00-{trace}-{span}-01"
+
+def parse_tp(s: str) -> Optional[tuple]:
+    p = (s or "").split("-")
+    return tuple(p) if len(p) == 4 else None
+
+def arg_digest(args: dict) -> str:
     return hashlib.sha256(
-        json.dumps(obj, sort_keys=True, default=str).encode()
+        json.dumps(args, sort_keys=True, separators=(",",":")).encode()
     ).hexdigest()
 
-
-def _new_hex(n_bytes: int = 8) -> str:
-    """Return n_bytes of nonzero random lowercase hex."""
-    while True:
-        val = secrets.token_hex(n_bytes)
-        if val != "0" * (n_bytes * 2):
-            return val
-
-
-def _new_span_id() -> str:
-    return _new_hex(8)
-
-
-def _new_trace_id() -> str:
-    return _new_hex(16)
-
-
-def _make_traceparent(trace_id: str, span_id: str) -> str:
-    return f"00-{trace_id}-{span_id}-01"
-
-
-def _parse_traceparent(tp: str) -> Optional[tuple]:
-    """Return (version, trace_id, span_id, flags) or None."""
-    if not tp:
-        return None
-    parts = tp.split("-")
-    if len(parts) != 4:
-        return None
-    return parts[0], parts[1], parts[2], parts[3]
-
-
-def _arguments_digest(arguments: dict) -> str:
-    """SHA-256 over recursively key-sorted compact JSON."""
-    sorted_json = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(sorted_json.encode()).hexdigest()
-
-
-def _new_action_id() -> str:
-    return "act_" + _new_hex(8)
-
-
-def _new_call_id() -> str:
-    return "call_" + _new_hex(8)
-
-
-def _new_approval_id() -> str:
-    return "appr_" + _new_hex(8)
+def strip_priv(d: dict) -> dict:
+    return {k: v for k, v in d.items() if not k.startswith("_")}
 
 
 # ---------------------------------------------------------------------------
-# Gemini planning call
+# Gemini call — fast model, no thinking, JSON mode, 12s timeout
 # ---------------------------------------------------------------------------
 
-def _call_gemini(incident: dict, tool_catalog: list, policy: dict) -> dict:
-    """
-    Ask Gemini to choose rootCause, cite evidence, and pick diagnostic tools.
-    Tries model fallbacks if primary model is unavailable.
-    """
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+def call_model(incident: dict, catalog: list, policy: dict) -> dict:
+    allowed   = incident.get("allowedRootCauses", [])
+    title     = incident.get("title", "")
+    service   = incident.get("service", "")
+    severity  = incident.get("severity", "")
+    transcript= incident.get("transcript", "")
+    max_diag  = policy.get("maximumDiagnostics", 3)
+    effect_names = set(policy.get("effectTools", []))
 
-    allowed = incident.get("allowedRootCauses", [])
-    transcript = incident.get("transcript", "")
-    max_diag = policy.get("maximumDiagnostics", 3)
-    effect_tools = policy.get("effectTools", [])
+    diag_tools = [t for t in catalog if t["name"] not in effect_names]
 
-    # Only pass non-sensitive info to model
-    diagnostic_tools = [
-        t for t in tool_catalog
-        if t["name"] not in effect_tools
-    ]
+    prompt = (
+        "You are an incident response AI. Analyze this incident and respond with ONLY "
+        "a JSON object (no markdown fences).\n\n"
+        f"Allowed root causes: {json.dumps(allowed)}\n"
+        f"Title: {title}\nService: {service}\nSeverity: {severity}\n\n"
+        f"Transcript (evidence IDs in [brackets]):\n{transcript[:6000]}\n\n"
+        f"Diagnostic tools available:\n{json.dumps(diag_tools, separators=(',',':'))[:2000]}\n\n"
+        f"Rules:\n"
+        f"- Pick exactly ONE rootCause from the allowed list\n"
+        f"- Cite exactly 2-4 evidence IDs that support it\n"
+        f"- Pick 1 to {max_diag} diagnostic tools (only directly relevant ones)\n"
+        f"- For each diagnostic, supply exact incident-specific arguments\n"
+        f"- Each diagnostic must cite at least one of your chosen evidence IDs\n\n"
+        "JSON shape:\n"
+        '{"rootCause":"...","evidence":["ev_...","ev_..."],'
+        '"diagnostics":[{"toolName":"...","arguments":{...},"evidence":["ev_..."]}]}'
+    )
 
-    prompt = f"""You are an expert incident response AI. Analyze the following incident transcript and:
-
-1. Choose exactly ONE root cause from this list: {json.dumps(allowed)}
-2. Cite exactly 2-4 evidence IDs from the transcript (they look like [ev_xxx] at line starts)
-3. Choose 1 to {max_diag} diagnostic tool calls from the catalog to confirm the root cause.
-   - Only choose tools that are directly relevant
-   - Use exact incident-specific arguments
-   - Each diagnostic must cite at least one of your chosen evidence IDs
-
-INCIDENT TITLE: {incident.get('title','')}
-SERVICE: {incident.get('service','')}
-SEVERITY: {incident.get('severity','')}
-
-TRANSCRIPT:
-{transcript[:8000]}
-
-AVAILABLE DIAGNOSTIC TOOLS:
-{json.dumps(diagnostic_tools, indent=2)[:3000]}
-
-Respond with ONLY valid JSON in this exact shape (no markdown):
-{{
-  "rootCause": "one value from allowedRootCauses",
-  "evidence": ["ev_xxx", "ev_yyy"],
-  "diagnostics": [
-    {{
-      "toolName": "tool_name",
-      "arguments": {{"key": "value"}},
-      "evidence": ["ev_xxx"]
-    }}
-  ]
-}}"""
+    cfg = genai.types.GenerationConfig(
+        temperature=0.0,
+        max_output_tokens=1024,
+    )
 
     last_err = None
-    response = None
-    used_model = model_name
-    for try_model in [model_name] + [m for m in GEMINI_MODEL_FALLBACKS if m != model_name]:
+    for model_name in MODELS:
         try:
-            m = genai.GenerativeModel(try_model)
-            response = m.generate_content(
-                prompt,
-                generation_config={"response_mime_type": "application/json"},
-            )
-            used_model = try_model
+            m = genai.GenerativeModel(model_name)
+            resp = m.generate_content(prompt, generation_config=cfg,
+                                      request_options={"timeout": 12})
+            text = resp.text.strip()
+            # strip fences
+            if text.startswith("```"):
+                lines = text.splitlines()
+                text = "\n".join(lines[1:-1] if lines[-1].startswith("```") else lines[1:])
+            result = json.loads(text.strip())
+            result["_model"] = model_name
             break
         except Exception as e:
             last_err = e
             continue
+    else:
+        raise RuntimeError(f"All models failed. Last: {last_err}")
 
-    if response is None:
-        raise last_err
-
-    text = response.text.strip()
-    # Strip markdown code fences if present
-    if text.startswith("```"):
-        lines = text.split("\n")
-        # remove first and last fence lines
-        inner = lines[1:-1] if lines[-1].startswith("```") else lines[1:]
-        text = "\n".join(inner).strip()
-    result = json.loads(text)
-
-    # Validate rootCause
+    # Sanitise
     if result.get("rootCause") not in allowed:
-        result["rootCause"] = allowed[0]
-
-    # Clamp evidence to 2-4
+        result["rootCause"] = allowed[0] if allowed else "unknown"
     ev = result.get("evidence", [])
-    if len(ev) < 2:
-        ev = ev + ["ev_unknown"] * (2 - len(ev))
-    result["evidence"] = ev[:4]
-
-    # Clamp diagnostics
+    if len(ev) < 2: ev += [ev[0]] * (2 - len(ev)) if ev else ["ev_unknown", "ev_unknown"]
+    result["evidence"] = list(dict.fromkeys(ev))[:4]   # dedup, max 4
     result["diagnostics"] = result.get("diagnostics", [])[:max_diag]
-    result["_used_model"] = used_model
     return result
 
 
 # ---------------------------------------------------------------------------
-# OTLP Trace builder
+# OTLP helpers
+# ---------------------------------------------------------------------------
+SK_INTERNAL, SK_SERVER, SK_CLIENT = 1, 2, 3
+ST_UNSET, ST_OK, ST_ERROR = 0, 1, 2
+NS = 1_000_000   # 1 ms in ns
+
+def attr(k, v):
+    if isinstance(v, int):   return {"key": k, "value": {"intValue": v}}
+    if isinstance(v, float): return {"key": k, "value": {"doubleValue": v}}
+    return {"key": k, "value": {"stringValue": str(v)}}
+
+def build_trace(st: dict) -> dict:
+    run_id = st["runId"]
+    marker = st.get("publicMarker", "")
+    tid    = st["_tid"]
+    t0     = st["_t0"]
+    common = [attr("ga5.run.id", run_id), attr("ga5.public.marker", marker)]
+    spans  = []
+    t = t0
+
+    def span(sid, parent, name, kind, attrs, t_start, dur, status=ST_UNSET,
+             links=None):
+        s = {
+            "traceId": tid, "spanId": sid,
+            "name": name, "kind": kind,
+            "startTimeUnixNano": str(t_start),
+            "endTimeUnixNano":   str(t_start + dur),
+            "attributes": attrs,
+            "status": {"code": status},
+        }
+        if parent: s["parentSpanId"] = parent
+        if links:  s["links"] = links
+        spans.append(s)
+
+    # SERVER
+    srv_id = st["_srv_sid"]
+    span(srv_id, None, "POST /v2/incidents", SK_SERVER, common[:], t, NS*100)
+    t += NS
+
+    # INTERNAL invoke_agent
+    agt_id = st["_agt_sid"]
+    span(agt_id, srv_id, "invoke_agent incident-response", SK_INTERNAL, common[:], t, NS*80)
+    t += NS
+
+    # CLIENT chat incident-plan (exactly one)
+    chat_id  = st["_chat_sid"]
+    model_nm = st.get("_model", _PRIMARY)
+    span(chat_id, agt_id, "chat incident-plan", SK_CLIENT,
+         common + [attr("gen_ai.operation.name","chat"),
+                   attr("gen_ai.request.model", model_nm)],
+         t, NS*20)
+    t += NS*21
+
+    # INTERNAL execute_tool + CLIENT per logical action
+    action_log  = st.get("actionLog", [])
+    receipt_log = st.get("receiptLog", [])
+    exec_sids   = {}   # actionId -> exec span id (for join links)
+
+    # Collect unique logical actions (first entry per actionId)
+    seen = set()
+    logical = []
+    for d in action_log:
+        if d["actionId"] not in seen:
+            seen.add(d["actionId"])
+            logical.append(d)
+
+    for disp in logical:
+        aid      = disp["actionId"]
+        tname    = disp["toolName"]
+        cid_first= disp["callId"]   # first call_id for gen_ai.tool.call.id
+
+        exec_sid = st.get(f"_esid_{aid}", span_id())
+        exec_sids[aid] = exec_sid
+
+        span(exec_sid, agt_id, f"execute_tool {tname}", SK_INTERNAL,
+             common + [attr("ga5.action.id", aid),
+                       attr("gen_ai.tool.name", tname),
+                       attr("gen_ai.tool.call.id", cid_first),
+                       attr("gen_ai.operation.name","execute_tool")],
+             t, NS*15)
+        t += NS
+
+        # CLIENT spans — one per attempt
+        attempts = [d for d in action_log if d["actionId"] == aid]
+        seen_att = set()
+        for d in attempts:
+            att = d.get("attempt", 1)
+            if att in seen_att: continue
+            seen_att.add(att)
+
+            csid = st.get(f"_csid_{aid}_{att}", span_id())
+            recs = [r for r in receipt_log
+                    if r.get("actionId") == aid and r.get("attempt") == att]
+            rec  = recs[0] if recs else None
+            http_s   = rec.get("status", 0)   if rec else 0
+            rec_id   = rec.get("receiptId","") if rec else ""
+            nonce    = rec.get("nonce","")     if rec else ""
+            err_type = rec.get("errorType","") if rec else ""
+            timeout  = (http_s == 0 and err_type == "timeout")
+            is503    = (http_s == 503)
+
+            c_attrs = common + [
+                attr("ga5.action.id", aid),
+                attr("ga5.attempt", att),
+                attr("http.request.method", "POST"),
+                attr("http.request.resend_count", att - 1),
+            ]
+            if rec_id: c_attrs.append(attr("ga5.receipt.id",    rec_id))
+            if nonce:  c_attrs.append(attr("ga5.receipt.nonce", nonce))
+
+            if timeout:
+                c_attrs.append(attr("error.type", "timeout"))
+                st_code = ST_ERROR
+            elif is503:
+                c_attrs.append(attr("error.type", "503"))
+                st_code = ST_ERROR
+            elif http_s and http_s != 200:
+                st_code = ST_ERROR
+            else:
+                st_code = ST_UNSET
+
+            if http_s:
+                c_attrs.append(attr("http.response.status_code", http_s))
+
+            span(csid, exec_sid, f"POST tool/{tname}", SK_CLIENT,
+                 c_attrs, t, NS*5, st_code)
+            t += NS*6
+
+    # INTERNAL incident.join — only when >1 unique diagnostic
+    diag_aids = [d["actionId"] for d in logical if d.get("phase")=="diagnostic"]
+    # deduplicate preserving order
+    seen2 = set(); uniq_diag_aids = []
+    for a in diag_aids:
+        if a not in seen2: seen2.add(a); uniq_diag_aids.append(a)
+
+    if len(uniq_diag_aids) > 1:
+        join_sid = st.get("_join_sid", span_id())
+        links = [{"traceId": tid, "spanId": exec_sids[a]}
+                 for a in uniq_diag_aids if a in exec_sids]
+        span(join_sid, agt_id, "incident.join", SK_INTERNAL,
+             common[:], t, NS*5, links=links)
+        t += NS*6
+
+    # INTERNAL approval_gate — if any approval happened
+    appr_recs = [r for r in receipt_log if "approvalId" in r]
+    if st.get("_had_approval") or appr_recs:
+        gate_sid = st.get("_gate_sid", span_id())
+        g_attrs  = common[:]
+        for r in appr_recs:
+            g_attrs.append(attr("ga5.approval.id",    r["approvalId"]))
+            g_attrs.append(attr("ga5.approval.nonce", r.get("nonce","")))
+        span(gate_sid, agt_id, "approval_gate", SK_INTERNAL, g_attrs, t, NS*5)
+
+    return {"resourceSpans":[{"resource":{"attributes":[attr("service.name","incident-response-agent")]},
+            "scopeSpans":[{"scope":{"name":"ga5.incident.agent","version":"1.0.0"},
+                           "spans": spans}]}]}
+
+
+# ---------------------------------------------------------------------------
+# Effect argument builder
 # ---------------------------------------------------------------------------
 
-SPAN_KIND_INTERNAL = 1
-SPAN_KIND_SERVER = 2
-SPAN_KIND_CLIENT = 3
-OTLP_STATUS_UNSET = 0
-OTLP_STATUS_OK = 1
-OTLP_STATUS_ERROR = 2
+def build_effect_args(tool: dict, st: dict) -> dict:
+    incident = st.get("_incident", {})
+    props    = tool.get("inputSchema", {}).get("properties", {})
+    args = {}
+    for k, spec in props.items():
+        kl = k.lower()
+        if "service" in kl:
+            args[k] = incident.get("service", "unknown")
+        elif "incident" in kl or (kl == "id"):
+            args[k] = incident.get("incidentId", "unknown")
+        elif spec.get("type") == "integer":
+            args[k] = spec.get("default", 2)
+        elif spec.get("type") == "boolean":
+            args[k] = spec.get("default", True)
+        else:
+            args[k] = incident.get(k, spec.get("default", "auto"))
+    return args
 
+# ---------------------------------------------------------------------------
+# Effect planner — called after all diagnostics complete
+# ---------------------------------------------------------------------------
 
-def _ts_ns() -> int:
-    return int(time.time_ns())
+def plan_effect(st: dict):
+    pending       = st.get("_pending", {})
+    action_log    = st.get("actionLog", [])
+    effect_tools  = st.get("_effect_tools", [])
+    approval_req  = st.get("_approval_req", [])
+    catalog       = st.get("_catalog", [])
 
+    if pending: return
+    if any(d.get("phase") == "effect" for d in action_log): return
+    if st.get("_pending_appr"): return
+    if not [d for d in action_log if d.get("phase") == "diagnostic"]: return
+    if not effect_tools: return
 
-def _make_attr(key: str, value) -> dict:
-    if isinstance(value, str):
-        return {"key": key, "value": {"stringValue": value}}
-    if isinstance(value, int):
-        return {"key": key, "value": {"intValue": value}}
-    if isinstance(value, float):
-        return {"key": key, "value": {"doubleValue": value}}
-    return {"key": key, "value": {"stringValue": str(value)}}
+    catalog_map = {t["name"]: t for t in catalog}
+    chosen = next((e for e in effect_tools if e in catalog_map), None)
+    if not chosen: return
 
+    tool   = catalog_map[chosen]
+    args   = build_effect_args(tool, st)
+    tid    = st["_tid"]
+    ts     = st.get("_incoming_ts","")
 
-def build_otlp_trace(state: dict) -> dict:
-    """
-    Build the required OTLP trace from stored state.
-
-    Structure:
-      SERVER   POST /v2/incidents
-      └─ INTERNAL invoke_agent incident-response
-         ├─ CLIENT   chat incident-plan
-         ├─ INTERNAL execute_tool <toolName>  (one per logical action)
-         │  └─ CLIENT POST tool/<toolName>    (one per attempt)
-         ├─ INTERNAL incident.join            (if fan-out > 1 diagnostic)
-         └─ INTERNAL approval_gate           (if approval happened)
-    """
-    run_id = state["runId"]
-    public_marker = state.get("publicMarker", "")
-    trace_id = state.get("_trace_id", _new_trace_id())
-    base_time = state.get("_trace_start_ns", _ts_ns())
-    dt = 1_000_000  # 1ms in ns
-
-    common_attrs = [
-        _make_attr("ga5.run.id", run_id),
-        _make_attr("ga5.public.marker", public_marker),
-    ]
-
-    spans = []
-    t = base_time
-
-    # --- SERVER span: POST /v2/incidents ---
-    server_span_id = state.get("_server_span_id", _new_span_id())
-    server_span = {
-        "traceId": trace_id,
-        "spanId": server_span_id,
-        "name": "POST /v2/incidents",
-        "kind": SPAN_KIND_SERVER,
-        "startTimeUnixNano": str(t),
-        "endTimeUnixNano": str(t + dt * 100),
-        "attributes": common_attrs[:],
-        "status": {"code": OTLP_STATUS_UNSET},
-    }
-    # Propagate incoming traceparent if present
-    incoming_tp = state.get("_incoming_traceparent")
-    incoming_ts = state.get("_incoming_tracestate")
-    if incoming_tp:
-        parsed = _parse_traceparent(incoming_tp)
-        if parsed:
-            server_span["traceId"] = parsed[1]
-    spans.append(server_span)
-    t += dt
-
-    # --- INTERNAL invoke_agent span ---
-    agent_span_id = state.get("_agent_span_id", _new_span_id())
-    agent_span = {
-        "traceId": trace_id,
-        "spanId": agent_span_id,
-        "parentSpanId": server_span_id,
-        "name": "invoke_agent incident-response",
-        "kind": SPAN_KIND_INTERNAL,
-        "startTimeUnixNano": str(t),
-        "endTimeUnixNano": str(t + dt * 90),
-        "attributes": common_attrs[:],
-        "status": {"code": OTLP_STATUS_UNSET},
-    }
-    spans.append(agent_span)
-    t += dt
-
-    # --- CLIENT chat incident-plan span ---
-    chat_span_id = state.get("_chat_span_id", _new_span_id())
-    model_name = state.get("_model_name", os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
-    chat_span = {
-        "traceId": trace_id,
-        "spanId": chat_span_id,
-        "parentSpanId": agent_span_id,
-        "name": "chat incident-plan",
-        "kind": SPAN_KIND_CLIENT,
-        "startTimeUnixNano": str(t),
-        "endTimeUnixNano": str(t + dt * 30),
-        "attributes": common_attrs + [
-            _make_attr("gen_ai.operation.name", "chat"),
-            _make_attr("gen_ai.request.model", model_name),
-        ],
-        "status": {"code": OTLP_STATUS_UNSET},
-    }
-    spans.append(chat_span)
-    t += dt * 31
-
-    # --- INTERNAL execute_tool + CLIENT spans per action ---
-    action_log = state.get("actionLog", [])
-    receipt_log = state.get("receiptLog", [])
-    tool_span_ids = {}  # actionId -> execute_tool span id (for join links)
-
-    # Build unique logical actions (first dispatch per actionId)
-    seen_action_ids = set()
-    unique_actions = []
-    for dispatch in action_log:
-        aid = dispatch["actionId"]
-        if aid not in seen_action_ids:
-            seen_action_ids.add(aid)
-            unique_actions.append(dispatch)
-
-    for dispatch in unique_actions:
-        action_id = dispatch["actionId"]
-        call_id = dispatch["callId"]
-        tool_name = dispatch["toolName"]
-
-        # Find all receipts for this action
-        receipts_for_action = [
-            r for r in receipt_log
-            if r.get("actionId") == action_id
-        ]
-
-        # INTERNAL execute_tool span
-        exec_span_id = state.get(f"_exec_span_{action_id}", _new_span_id())
-        tool_span_ids[action_id] = exec_span_id
-
-        exec_attrs = common_attrs + [
-            _make_attr("ga5.action.id", action_id),
-            _make_attr("gen_ai.tool.name", tool_name),
-            _make_attr("gen_ai.tool.call.id", call_id),
-            _make_attr("gen_ai.operation.name", "execute_tool"),
-        ]
-        exec_span = {
-            "traceId": trace_id,
-            "spanId": exec_span_id,
-            "parentSpanId": agent_span_id,
-            "name": f"execute_tool {tool_name}",
-            "kind": SPAN_KIND_INTERNAL,
-            "startTimeUnixNano": str(t),
-            "endTimeUnixNano": str(t + dt * 20),
-            "attributes": exec_attrs,
-            "status": {"code": OTLP_STATUS_UNSET},
+    if chosen in approval_req:
+        # Need approval first
+        aid  = act_id()
+        apid = appr_id()
+        dig  = arg_digest(args)
+        st["_pending_appr"][apid] = {
+            "approvalId": apid, "actionId": aid,
+            "toolName": chosen, "arguments": args,
         }
-        spans.append(exec_span)
-        t += dt
+        st["dispatches"] = []
+        st["approvals"]  = [{"approvalId": apid, "actionId": aid,
+                              "toolName": chosen, "argumentsDigest": dig}]
+        st["_had_approval"] = True
+        st["_gate_sid"] = span_id()
+        return
 
-        # CLIENT POST tool/<toolName> spans per attempt
-        # Retries are separate entries in action_log with same actionId, higher attempt
-        attempts_for_action = [
-            d for d in action_log
-            if d.get("actionId") == action_id
-        ]
-        seen_attempts = set()
-        for disp in attempts_for_action:
-            att = disp.get("attempt", 1)
-            if att in seen_attempts:
-                continue
-            seen_attempts.add(att)
-            # Look up stored client span ID
-            client_span_id = state.get(
-                f"_client_span_{action_id}_{att}",
-                _new_span_id()
-            )
-            # Find receipt for this specific attempt
-            rec = next(
-                (r for r in receipts_for_action if r.get("attempt") == att), None
-            )
-            http_status = rec.get("status", 0) if rec else 0
-            receipt_id = rec.get("receiptId", "") if rec else ""
-            nonce = rec.get("nonce", "") if rec else ""
-            is_timeout = (rec and rec.get("status") == 0 and
-                          rec.get("errorType") == "timeout") if rec else False
-            is_503 = http_status == 503
-
-            client_attrs = common_attrs + [
-                _make_attr("ga5.action.id", action_id),
-                _make_attr("ga5.attempt", att),
-                _make_attr("http.request.method", "POST"),
-                _make_attr("http.request.resend_count", att - 1),
-            ]
-            if receipt_id:
-                client_attrs.append(_make_attr("ga5.receipt.id", receipt_id))
-            if nonce:
-                client_attrs.append(_make_attr("ga5.receipt.nonce", nonce))
-
-            span_status = {"code": OTLP_STATUS_UNSET}
-            if is_timeout:
-                client_attrs.append(_make_attr("error.type", "timeout"))
-                span_status = {"code": OTLP_STATUS_ERROR}
-            elif is_503:
-                client_attrs.append(_make_attr("error.type", "503"))
-                span_status = {"code": OTLP_STATUS_ERROR}
-            elif http_status and http_status != 200:
-                span_status = {"code": OTLP_STATUS_ERROR}
-
-            if http_status:
-                client_attrs.append(_make_attr("http.response.status_code", http_status))
-
-            client_span = {
-                "traceId": trace_id,
-                "spanId": client_span_id,
-                "parentSpanId": exec_span_id,
-                "name": f"POST tool/{tool_name}",
-                "kind": SPAN_KIND_CLIENT,
-                "startTimeUnixNano": str(t),
-                "endTimeUnixNano": str(t + dt * 5),
-                "attributes": client_attrs,
-                "status": span_status,
-            }
-            spans.append(client_span)
-            t += dt * 6
-
-    # --- INTERNAL incident.join (if >1 diagnostic dispatch) ---
-    diag_dispatches = [d for d in action_log if d.get("phase") == "diagnostic"]
-    unique_diag_actions = list({d["actionId"]: d for d in diag_dispatches}.values())
-    if len(unique_diag_actions) > 1:
-        join_span_id = state.get("_join_span_id", _new_span_id())
-        links = [
-            {"traceId": trace_id, "spanId": tool_span_ids.get(d["actionId"], "")}
-            for d in unique_diag_actions
-            if tool_span_ids.get(d["actionId"])
-        ]
-        join_span = {
-            "traceId": trace_id,
-            "spanId": join_span_id,
-            "parentSpanId": agent_span_id,
-            "name": "incident.join",
-            "kind": SPAN_KIND_INTERNAL,
-            "startTimeUnixNano": str(t),
-            "endTimeUnixNano": str(t + dt * 5),
-            "attributes": common_attrs[:],
-            "links": links,
-            "status": {"code": OTLP_STATUS_UNSET},
-        }
-        spans.append(join_span)
-        t += dt * 6
-
-    # --- INTERNAL approval_gate (if approval happened) ---
-    approvals_in_receipts = [r for r in receipt_log if "approvalId" in r]
-    pending_approvals = state.get("_pending_approvals", {})
-    all_approvals = list(pending_approvals.values()) + [
-        {"approvalId": r["approvalId"]} for r in approvals_in_receipts
-    ]
-
-    if all_approvals or state.get("_had_approval"):
-        gate_span_id = state.get("_gate_span_id", _new_span_id())
-        gate_attrs = common_attrs[:]
-        # Add approval metadata from receipt
-        for r in approvals_in_receipts:
-            gate_attrs.append(_make_attr("ga5.approval.id", r["approvalId"]))
-            gate_attrs.append(_make_attr("ga5.approval.nonce", r.get("nonce", "")))
-        gate_span = {
-            "traceId": trace_id,
-            "spanId": gate_span_id,
-            "parentSpanId": agent_span_id,
-            "name": "approval_gate",
-            "kind": SPAN_KIND_INTERNAL,
-            "startTimeUnixNano": str(t),
-            "endTimeUnixNano": str(t + dt * 5),
-            "attributes": gate_attrs,
-            "status": {"code": OTLP_STATUS_UNSET},
-        }
-        spans.append(gate_span)
-
-    return {
-        "resourceSpans": [{
-            "resource": {
-                "attributes": [
-                    _make_attr("service.name", "incident-response-agent"),
-                ]
-            },
-            "scopeSpans": [{
-                "scope": {"name": "ga5.incident.agent", "version": "1.0.0"},
-                "spans": spans,
-            }]
-        }]
+    # No approval needed — dispatch immediately
+    aid  = act_id()
+    cid  = call_id()
+    csid = span_id()
+    esid = span_id()
+    d = {
+        "actionId": aid, "callId": cid, "phase": "effect",
+        "toolName": chosen, "arguments": args,
+        "evidence": st["diagnosis"]["evidence"][:2],
+        "attempt": 1,
+        "traceparent": tp(tid, csid),
     }
+    if ts: d["tracestate"] = ts
+
+    st["dispatches"] = [strip_priv(d)]
+    st["approvals"]  = []
+    st["actionLog"].append(strip_priv(d))
+    st["_pending"][aid] = d
+    st[f"_esid_{aid}"] = esid
+    st[f"_csid_{aid}_1"] = csid
+
+
+# ---------------------------------------------------------------------------
+# Terminal check
+# ---------------------------------------------------------------------------
+
+def maybe_terminal(st: dict):
+    if st["status"] in ("completed","failed"): return
+    if st.get("_pending"): return
+    if st.get("_pending_appr"): return
+
+    has_effect = any(d.get("phase")=="effect" for d in st.get("actionLog",[]))
+    if not has_effect and st.get("_effect_tools"):
+        return  # plan_effect will handle it next
+
+    st["status"] = "completed" if st.get("chosenEffect") else "failed"
+    st["dispatches"] = []
+    st["approvals"]  = []
+    st["otlp"] = build_trace(st)
+
+# ---------------------------------------------------------------------------
+# Response serialiser — never echo sensitive fields
+# ---------------------------------------------------------------------------
+
+_REDACT = {"sensitive","accessToken","privateNote","authorization",
+           "doNotExport","transcript","prompt","prompts"}
+
+def redact(obj):
+    if isinstance(obj, dict):
+        return {k: redact(v) for k, v in obj.items() if k not in _REDACT}
+    if isinstance(obj, list):
+        return [redact(i) for i in obj]
+    return obj
+
+def make_response(st: dict) -> dict:
+    r = {"runId": st["runId"], "status": st["status"],
+         "diagnosis": st["diagnosis"]}
+    if st["status"] in ("completed","failed"):
+        r["chosenEffect"] = st.get("chosenEffect")
+        r["suppressed"]   = st.get("suppressed", [])
+        r["actionLog"]    = st.get("actionLog", [])
+        r["receiptLog"]   = st.get("receiptLog", [])
+        r["dispatches"]   = []
+        r["approvals"]    = []
+        if "otlp" in st: r["otlp"] = st["otlp"]
+    else:
+        r["dispatches"] = st.get("dispatches", [])
+        r["approvals"]  = st.get("approvals",  [])
+    return redact(r)
 
 
 # ---------------------------------------------------------------------------
@@ -497,162 +439,121 @@ async def create_incident(request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        raise HTTPException(400, "Invalid JSON")
 
-    # Validate profile
-    profile = body.get("profile", "")
+    profile = body.get("profile","")
     if profile != "ga5-incident-agent/v2":
-        raise HTTPException(status_code=400, detail=f"Unsupported profile: {profile}")
+        raise HTTPException(400, f"Unsupported profile: {profile}")
 
-    run_id = body.get("runId", "")
+    run_id = body.get("runId","")
     if not run_id:
-        raise HTTPException(status_code=422, detail="Missing runId")
+        raise HTTPException(422, "Missing runId")
 
-    body_hash = _content_hash(body)
+    bh = _sha(body)
 
-    # Replay: same runId + same content -> return stored state without model call
+    # ---- replay / 409 ----
     if run_id in STORE:
-        stored = STORE[run_id]
-        stored_hash = CONTENT_HASHES.get(f"incident:{run_id}", "")
-        if stored_hash and stored_hash != body_hash:
-            return JSONResponse(status_code=409, content={
-                "error": "conflict",
-                "detail": "runId exists with different content"
-            })
-        # Replay: return current stored response
-        return JSONResponse(content=_build_response(stored))
+        if HASHES.get(f"incident:{run_id}","") != bh:
+            return JSONResponse(status_code=409,
+                content={"error":"conflict","detail":"runId content changed"})
+        return JSONResponse(content=make_response(STORE[run_id]))
 
-    # Extract fields (never send sensitive to model)
-    incident = body.get("incident", {})
-    tool_catalog = body.get("toolCatalog", [])
-    policy = body.get("policy", {})
-    public_marker = body.get("publicMarker", "")
-    agent_name = body.get("agentName", "incident-response")
+    # ---- fresh run ----
+    incident = body.get("incident",{})
+    catalog  = body.get("toolCatalog",[])
+    policy   = body.get("policy",{})
+    marker   = body.get("publicMarker","")
+    agent_nm = body.get("agentName","incident-response")
 
-    # Parse incoming traceparent / tracestate
-    headers = dict(request.headers)
-    incoming_tp = headers.get("traceparent", "")
-    incoming_ts = headers.get("tracestate", "")
+    hdrs = dict(request.headers)
+    inc_tp = hdrs.get("traceparent","")
+    inc_ts = hdrs.get("tracestate","")
 
-    # Set up trace IDs
-    parsed = _parse_traceparent(incoming_tp) if incoming_tp else None
-    if parsed:
-        trace_id = parsed[1]
-    else:
-        trace_id = _new_trace_id()
-        incoming_tp = ""
-        incoming_ts = ""
+    parsed = parse_tp(inc_tp)
+    tid = parsed[1] if parsed else trace_id()
+    if not parsed: inc_tp = ""; inc_ts = ""
 
-    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-
-    # Call Gemini for planning
+    # ---- model call ----
     try:
-        plan = _call_gemini(incident, tool_catalog, policy)
+        plan = call_model(incident, catalog, policy)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Model error: {str(e)}")
+        raise HTTPException(500, f"Model error: {e}")
 
-    root_cause = plan["rootCause"]
-    evidence = plan["evidence"]
-    diagnostics = plan.get("diagnostics", [])
+    root_cause  = plan["rootCause"]
+    evidence    = plan["evidence"]
+    diagnostics = plan.get("diagnostics",[])
+    used_model  = plan.get("_model", _PRIMARY)
 
-    effect_tools = policy.get("effectTools", [])
-    approval_required = policy.get("approvalRequiredFor", [])
+    effect_tools = policy.get("effectTools",[])
+    approval_req = policy.get("approvalRequiredFor",[])
 
-    # Build dispatches for diagnostic tools
+    # ---- build dispatches ----
     dispatches = []
     action_log = []
-    span_meta = {}  # actionId -> {exec_span_id, client_span_id}
+    esids = {}; csids = {}
 
     for diag in diagnostics:
-        tool_name = diag.get("toolName", "")
-        arguments = diag.get("arguments", {})
-        diag_evidence = diag.get("evidence", evidence[:1])
+        tname   = diag.get("toolName","")
+        args    = diag.get("arguments",{})
+        d_ev    = diag.get("evidence", evidence[:1])
+        # ensure at least 1 evidence from diagnosis set
+        if not any(e in evidence for e in d_ev):
+            d_ev = evidence[:1]
 
-        action_id = _new_action_id()
-        call_id = _new_call_id()
-        client_span_id = _new_span_id()
-        exec_span_id = _new_span_id()
+        aid  = act_id(); cid = call_id()
+        csid = span_id(); esid = span_id()
+        esids[aid] = esid; csids[(aid,1)] = csid
 
-        traceparent = _make_traceparent(trace_id, client_span_id)
-
-        dispatch = {
-            "actionId": action_id,
-            "callId": call_id,
-            "phase": "diagnostic",
-            "toolName": tool_name,
-            "arguments": arguments,
-            "evidence": diag_evidence,
-            "attempt": 1,
-            "traceparent": traceparent,
+        d = {
+            "actionId": aid, "callId": cid, "phase": "diagnostic",
+            "toolName": tname, "arguments": args, "evidence": d_ev,
+            "attempt": 1, "traceparent": tp(tid, csid),
         }
-        if incoming_ts:
-            dispatch["tracestate"] = incoming_ts
+        if inc_ts: d["tracestate"] = inc_ts
+        dispatches.append(d)
+        action_log.append(strip_priv(d))
 
-        dispatches.append(dispatch)
-        action_log.append({**dispatch, "_client_span_id": client_span_id})
-        span_meta[action_id] = {
-            "exec_span_id": exec_span_id,
-            "client_span_id": client_span_id,
-        }
+    # stable trace span IDs
+    srv_sid  = span_id(); agt_sid = span_id()
+    chat_sid = span_id(); t0 = time.time_ns()
 
-    # Stable span IDs for trace
-    server_span_id = _new_span_id()
-    agent_span_id = _new_span_id()
-    chat_span_id = _new_span_id()
-    trace_start_ns = _ts_ns()
-
-    # Build span ID registry
-    exec_span_ids = {aid: m["exec_span_id"] for aid, m in span_meta.items()}
-    for aid, m in span_meta.items():
-        exec_span_ids[aid] = m["exec_span_id"]
-
-    # State to persist
     state = {
-        "runId": run_id,
-        "status": "waiting",
-        "publicMarker": public_marker,
+        "runId": run_id, "status": "waiting",
+        "publicMarker": marker,
         "diagnosis": {"rootCause": root_cause, "evidence": evidence},
-        "dispatches": [_strip_internal(d) for d in dispatches],
-        "approvals": [],
-        "actionLog": [_strip_internal(d) for d in action_log],
+        "dispatches": [strip_priv(d) for d in dispatches],
+        "approvals":  [],
+        "actionLog":  action_log,
         "receiptLog": [],
         "chosenEffect": None,
-        "suppressed": [],
-        # Internal trace state
-        "_trace_id": trace_id,
-        "_trace_start_ns": trace_start_ns,
-        "_server_span_id": server_span_id,
-        "_agent_span_id": agent_span_id,
-        "_chat_span_id": chat_span_id,
-        "_model_name": plan.get("_used_model", model_name),
-        "_incoming_traceparent": incoming_tp,
-        "_incoming_tracestate": incoming_ts,
-        "_pending_actions": {
-            d["actionId"]: d for d in dispatches
-        },
-        "_pending_approvals": {},
+        "suppressed":  [],
+        # trace
+        "_tid": tid, "_t0": t0,
+        "_srv_sid": srv_sid, "_agt_sid": agt_sid,
+        "_chat_sid": chat_sid, "_model": used_model,
+        "_incoming_tp": inc_tp, "_incoming_ts": inc_ts,
+        # runtime
+        "_pending": {d["actionId"]: d for d in dispatches},
+        "_pending_appr": {},
         "_had_approval": False,
         "_effect_tools": effect_tools,
-        "_approval_required": approval_required,
-        "_tool_catalog": tool_catalog,
+        "_approval_req": approval_req,
+        "_catalog": catalog,
         "_policy": policy,
-        "_plan": plan,
         "_incident": incident,
-        "_agent_name": agent_name,
-        # Store exec span IDs for trace building
-        **{f"_exec_span_{aid}": m["exec_span_id"] for aid, m in span_meta.items()},
-        **{f"_client_span_{aid}_1": m["client_span_id"] for aid, m in span_meta.items()},
+        "_agent_nm": agent_nm,
     }
+    # store span IDs
+    for (aid,att), csid in csids.items():
+        state[f"_csid_{aid}_{att}"] = csid
+    for aid, esid in esids.items():
+        state[f"_esid_{aid}"] = esid
+    if len(dispatches) > 1:
+        state["_join_sid"] = span_id()
 
     STORE[run_id] = state
-    CONTENT_HASHES[f"incident:{run_id}"] = body_hash
-
-    return JSONResponse(content=_build_response(state))
-
-
-def _strip_internal(d: dict) -> dict:
-    """Remove _internal keys from a dispatch dict."""
-    return {k: v for k, v in d.items() if not k.startswith("_")}
+    HASHES[f"incident:{run_id}"] = bh
+    return JSONResponse(content=make_response(state))
 
 
 # ---------------------------------------------------------------------------
@@ -664,340 +565,129 @@ async def post_receipt(run_id: str, request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        raise HTTPException(400, "Invalid JSON")
 
     if run_id not in STORE:
-        raise HTTPException(status_code=404, detail="Run not found")
+        raise HTTPException(404, "Run not found")
 
-    state = STORE[run_id]
+    st = STORE[run_id]
+    rid = body.get("receiptId","")
+    if not rid:
+        raise HTTPException(422, "Missing receiptId")
 
-    # Completed runs: replay only
-    if state["status"] in ("completed", "failed"):
-        receipt_id = body.get("receiptId", "")
-        receipt_hash = _content_hash(body)
-        stored_hash = CONTENT_HASHES.get(f"receipt:{receipt_id}", "")
-        if stored_hash and stored_hash != receipt_hash:
-            return JSONResponse(status_code=409, content={
-                "error": "conflict", "detail": "receiptId exists with different content"
-            })
-        return JSONResponse(content=_build_response(state))
+    rh = _sha(body)
+    hk = f"receipt:{rid}"
 
-    receipt_id = body.get("receiptId", "")
-    if not receipt_id:
-        raise HTTPException(status_code=422, detail="Missing receiptId")
+    # ---- 409 / replay ----
+    if hk in HASHES:
+        if HASHES[hk] != rh:
+            return JSONResponse(status_code=409,
+                content={"error":"conflict","detail":"receiptId content changed"})
+        return JSONResponse(content=make_response(st))
 
-    receipt_hash = _content_hash(body)
+    # ---- terminal replay ----
+    if st["status"] in ("completed","failed"):
+        HASHES[hk] = rh
+        return JSONResponse(content=make_response(st))
 
-    # 409 if same receiptId with changed content
-    if f"receipt:{receipt_id}" in CONTENT_HASHES:
-        if CONTENT_HASHES[f"receipt:{receipt_id}"] != receipt_hash:
-            return JSONResponse(status_code=409, content={
-                "error": "conflict", "detail": "receiptId exists with different content"
-            })
-        # Replay
-        return JSONResponse(content=_build_response(state))
+    HASHES[hk] = rh
 
-    CONTENT_HASHES[f"receipt:{receipt_id}"] = receipt_hash
+    tid = st["_tid"]
+    inc_ts = st.get("_incoming_ts","")
 
-    # Handle approval receipts
-    approvals_in_body = body.get("approvals", [])
-    outcomes_in_body = body.get("outcomes", [])
+    # ---- process approvals ----
+    for appr in body.get("approvals",[]):
+        apid      = appr.get("approvalId","")
+        decision  = appr.get("decision","")
+        nonce     = appr.get("nonce","")
+        pending_a = st.get("_pending_appr",{})
+        if apid not in pending_a: continue
 
-    for appr in approvals_in_body:
-        appr_id = appr.get("approvalId", "")
-        decision = appr.get("decision", "")
-        nonce = appr.get("nonce", "")
-
-        pending = state.get("_pending_approvals", {})
-        if appr_id not in pending:
-            continue  # ignore unknown approval
-
-        # Record approval receipt
-        state["receiptLog"].append({
-            "receiptId": receipt_id,
-            "approvalId": appr_id,
-            "decision": decision,
-            "nonce": nonce,
+        st["receiptLog"].append({
+            "receiptId": rid, "approvalId": apid,
+            "decision": decision, "nonce": nonce,
         })
 
         if decision == "approved":
-            # Dispatch the effect
-            appr_info = pending[appr_id]
-            tool_name = appr_info["toolName"]
-            arguments = appr_info["arguments"]
-            action_id = appr_info["actionId"]
-            call_id = _new_call_id()
-            client_span_id = _new_span_id()
-            exec_span_id = _new_span_id()
-            trace_id = state["_trace_id"]
-            incoming_ts = state.get("_incoming_tracestate", "")
+            info = pending_a[apid]
+            aid  = info["actionId"]
+            tname= info["toolName"]
+            args = info["arguments"]
+            cid  = call_id(); csid = span_id(); esid = span_id()
 
-            dispatch = {
-                "actionId": action_id,
-                "callId": call_id,
-                "phase": "effect",
-                "toolName": tool_name,
-                "arguments": arguments,
-                "evidence": state["diagnosis"]["evidence"][:2],
-                "attempt": 1,
-                "traceparent": _make_traceparent(trace_id, client_span_id),
-                "approvalId": appr_id,
-                "approvalNonce": nonce,
+            d = {
+                "actionId": aid, "callId": cid, "phase": "effect",
+                "toolName": tname, "arguments": args,
+                "evidence": st["diagnosis"]["evidence"][:2],
+                "attempt": 1, "traceparent": tp(tid, csid),
+                "approvalId": apid, "approvalNonce": nonce,
             }
-            if incoming_ts:
-                dispatch["tracestate"] = incoming_ts
+            if inc_ts: d["tracestate"] = inc_ts
 
-            state["dispatches"] = [_strip_internal(dispatch)]
-            state["approvals"] = []
-            state["actionLog"].append(_strip_internal(dispatch))
-            state["_pending_actions"][action_id] = dispatch
-            state[f"_exec_span_{action_id}"] = exec_span_id
-            state[f"_client_span_{action_id}_1"] = client_span_id
-            del pending[appr_id]
-            state["_had_approval"] = True
+            st["dispatches"] = [strip_priv(d)]
+            st["approvals"]  = []
+            st["actionLog"].append(strip_priv(d))
+            st["_pending"][aid] = d
+            st[f"_esid_{aid}"] = esid
+            st[f"_csid_{aid}_1"] = csid
+            del pending_a[apid]
 
-    # Handle tool outcome receipts
-    for outcome in outcomes_in_body:
-        action_id = outcome.get("actionId", "")
-        call_id = outcome.get("callId", "")
-        attempt = outcome.get("attempt", 1)
-        status = outcome.get("status", 0)
-        result_class = outcome.get("resultClass", "")
-        nonce = outcome.get("nonce", "")
-        error_type = outcome.get("errorType", "")
+    # ---- process outcomes ----
+    for out in body.get("outcomes",[]):
+        aid       = out.get("actionId","")
+        cid       = out.get("callId","")
+        att       = out.get("attempt",1)
+        status    = out.get("status",0)
+        r_class   = out.get("resultClass","")
+        nonce     = out.get("nonce","")
+        err_type  = out.get("errorType","")
 
-        # Only accept pending calls
-        pending = state.get("_pending_actions", {})
-        if action_id not in pending:
-            continue
+        pending = st.get("_pending",{})
+        if aid not in pending: continue
 
-        # Record receipt
         rec = {
-            "receiptId": receipt_id,
-            "actionId": action_id,
-            "callId": call_id,
-            "attempt": attempt,
-            "status": status,
-            "resultClass": result_class,
-            "nonce": nonce,
+            "receiptId": rid, "actionId": aid, "callId": cid,
+            "attempt": att, "status": status,
+            "resultClass": r_class, "nonce": nonce,
         }
-        if error_type:
-            rec["errorType"] = error_type
-        state["receiptLog"].append(rec)
+        if err_type: rec["errorType"] = err_type
+        st["receiptLog"].append(rec)
 
-        # Update CLIENT span with receipt info
-        state[f"_receipt_status_{action_id}_{attempt}"] = status
-        state[f"_receipt_nonce_{action_id}_{attempt}"] = nonce
-        state[f"_receipt_id_{action_id}_{attempt}"] = receipt_id
-
-        dispatch = pending[action_id]
+        disp = pending[aid]
 
         if status == 503:
-            # Retry once
-            new_attempt = attempt + 1
-            new_call_id = _new_call_id()
-            client_span_id = _new_span_id()
-            trace_id = state["_trace_id"]
-            incoming_ts = state.get("_incoming_tracestate", "")
+            # one retry
+            new_att  = att + 1
+            new_cid  = call_id()
+            new_csid = span_id()
+            nd = {**strip_priv(disp),
+                  "callId": new_cid, "attempt": new_att,
+                  "traceparent": tp(tid, new_csid)}
+            nd.pop("approvalId", None); nd.pop("approvalNonce", None)
+            if inc_ts: nd["tracestate"] = inc_ts
 
-            new_dispatch = {**_strip_internal(dispatch),
-                            "callId": new_call_id,
-                            "attempt": new_attempt,
-                            "traceparent": _make_traceparent(trace_id, client_span_id),
-                            "_client_span_id": client_span_id,
-                            }
-            if incoming_ts:
-                new_dispatch["tracestate"] = incoming_ts
-            # Remove approval from retry
-            new_dispatch.pop("approvalId", None)
-            new_dispatch.pop("approvalNonce", None)
+            st["dispatches"] = [strip_priv(nd)]
+            st["approvals"]  = []
+            st["actionLog"].append(strip_priv(nd))
+            st["_pending"][aid] = nd
+            st[f"_csid_{aid}_{new_att}"] = new_csid
 
-            state["dispatches"] = [_strip_internal(new_dispatch)]
-            state["approvals"] = []
-            state["actionLog"].append(_strip_internal(new_dispatch))
-            state["_pending_actions"][action_id] = new_dispatch
-            state[f"_client_span_{action_id}_{new_attempt}"] = client_span_id
-            continue
-
-        elif status == 0 and error_type == "timeout":
-            # Timeout: suppress this action's dependent effect
-            state["suppressed"].append(action_id)
-            del pending[action_id]
+        elif status == 0 and err_type == "timeout":
+            st["suppressed"].append(aid)
+            del pending[aid]
 
         elif status == 200:
-            # Success
-            del pending[action_id]
-            phase = dispatch.get("phase", "diagnostic")
-            if phase == "effect":
-                state["chosenEffect"] = dispatch["toolName"]
+            del pending[aid]
+            if disp.get("phase") == "effect":
+                st["chosenEffect"] = disp["toolName"]
 
         else:
-            # Other error: mark failed
-            del pending[action_id]
+            del pending[aid]
 
-    # Check if all diagnostics are done -> plan effect
-    _maybe_plan_effect(state)
-
-    # Check if terminal
-    _check_terminal(state)
-
-    STORE[run_id] = state
-    return JSONResponse(content=_build_response(state))
-
-
-# ---------------------------------------------------------------------------
-# Effect planning helper
-# ---------------------------------------------------------------------------
-
-def _maybe_plan_effect(state: dict):
-    """
-    After all diagnostics complete (no pending diagnostic actions),
-    choose and dispatch exactly one effect.
-    """
-    pending = state.get("_pending_actions", {})
-    action_log = state.get("actionLog", [])
-    receipt_log = state.get("receiptLog", [])
-    effect_tools = state.get("_effect_tools", [])
-    approval_required = state.get("_approval_required", [])
-    tool_catalog = state.get("_tool_catalog", [])
-
-    # Still have pending actions?
-    if pending:
-        return
-
-    # Already have an effect dispatch or chosen?
-    effect_dispatched = any(d.get("phase") == "effect" for d in action_log)
-    if effect_dispatched:
-        return
-
-    # Already waiting for approval?
-    if state.get("_pending_approvals"):
-        return
-
-    # All diagnostics done (success or suppressed)
-    diag_dispatches = [d for d in action_log if d.get("phase") == "diagnostic"]
-    if not diag_dispatches:
-        return
-
-    # Check if any timeout suppression blocks all - still proceed with effect
-    # Choose effect tool from catalog
-    if not effect_tools:
-        return
-
-    # Find the effect tool in catalog
-    plan = state.get("_plan", {})
-    chosen_tool_name = None
-
-    # Try to use Gemini plan if it included an effect, else pick first effect tool
-    # We pick the first available effect tool that's in the catalog
-    catalog_names = {t["name"]: t for t in tool_catalog}
-    for et in effect_tools:
-        if et in catalog_names:
-            chosen_tool_name = et
-            break
-
-    if not chosen_tool_name:
-        return
-
-    chosen_tool = catalog_names[chosen_tool_name]
-
-    # Build arguments: use incident context intelligently
-    # For simplicity, use empty args or defaults from schema
-    arguments = _build_effect_arguments(chosen_tool, state)
-
-    trace_id = state["_trace_id"]
-    incoming_ts = state.get("_incoming_tracestate", "")
-
-    # Needs approval?
-    if chosen_tool_name in approval_required:
-        action_id = _new_action_id()
-        approval_id = _new_approval_id()
-        digest = _arguments_digest(arguments)
-
-        state["_pending_approvals"][approval_id] = {
-            "approvalId": approval_id,
-            "actionId": action_id,
-            "toolName": chosen_tool_name,
-            "arguments": arguments,
-        }
-        state["dispatches"] = []
-        state["approvals"] = [{
-            "approvalId": approval_id,
-            "actionId": action_id,
-            "toolName": chosen_tool_name,
-            "argumentsDigest": digest,
-        }]
-        state["_had_approval"] = True
-        return
-
-    # No approval needed
-    action_id = _new_action_id()
-    call_id = _new_call_id()
-    client_span_id = _new_span_id()
-    exec_span_id = _new_span_id()
-
-    dispatch = {
-        "actionId": action_id,
-        "callId": call_id,
-        "phase": "effect",
-        "toolName": chosen_tool_name,
-        "arguments": arguments,
-        "evidence": state["diagnosis"]["evidence"][:2],
-        "attempt": 1,
-        "traceparent": _make_traceparent(trace_id, client_span_id),
-    }
-    if incoming_ts:
-        dispatch["tracestate"] = incoming_ts
-
-    state["dispatches"] = [_strip_internal(dispatch)]
-    state["approvals"] = []
-    state["actionLog"].append(_strip_internal(dispatch))
-    state["_pending_actions"][action_id] = dispatch
-    state[f"_exec_span_{action_id}"] = exec_span_id
-    state[f"_client_span_{action_id}_1"] = client_span_id
-
-
-def _build_effect_arguments(tool: dict, state: dict) -> dict:
-    """Build minimal valid arguments for an effect tool."""
-    schema = tool.get("inputSchema", {})
-    props = schema.get("properties", {})
-    incident = state.get("_incident", {})
-    args = {}
-    for key, spec in props.items():
-        # Try to fill from incident fields
-        if "service" in key.lower():
-            args[key] = incident.get("service", "unknown-service")
-        elif "incident" in key.lower() or "id" in key.lower():
-            args[key] = incident.get("incidentId", "unknown")
-        elif spec.get("type") == "string":
-            args[key] = incident.get(key, spec.get("default", "auto"))
-        elif spec.get("type") == "integer":
-            args[key] = spec.get("default", 1)
-        elif spec.get("type") == "boolean":
-            args[key] = spec.get("default", True)
-    return args
-
-
-def _check_terminal(state: dict):
-    """If no pending work, mark completed/failed."""
-    pending = state.get("_pending_actions", {})
-    pending_approvals = state.get("_pending_approvals", {})
-    if pending or pending_approvals:
-        return
-    if state["status"] in ("completed", "failed"):
-        return
-
-    # Still waiting for effects?
-    effect_dispatched = any(d.get("phase") == "effect" for d in state.get("actionLog", []))
-    if not effect_dispatched and state.get("_effect_tools"):
-        return  # will plan effect next
-
-    # All done
-    state["status"] = "completed" if state.get("chosenEffect") else "failed"
-    state["dispatches"] = []
-    state["approvals"] = []
-    # Build final OTLP
-    state["otlp"] = build_otlp_trace(state)
+    plan_effect(st)
+    maybe_terminal(st)
+    STORE[run_id] = st
+    return JSONResponse(content=make_response(st))
 
 
 # ---------------------------------------------------------------------------
@@ -1007,81 +697,28 @@ def _check_terminal(state: dict):
 @app.get("/v2/incidents/{run_id}")
 async def get_incident(run_id: str):
     if run_id not in STORE:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return JSONResponse(content=_build_response(STORE[run_id]))
+        raise HTTPException(404, "Run not found")
+    return JSONResponse(content=make_response(STORE[run_id]))
 
 
 # ---------------------------------------------------------------------------
-# Response builder
-# ---------------------------------------------------------------------------
-
-def _build_response(state: dict) -> dict:
-    """Build the public-facing response from internal state."""
-    resp = {
-        "runId": state["runId"],
-        "status": state["status"],
-        "diagnosis": state["diagnosis"],
-    }
-
-    if state["status"] in ("completed", "failed"):
-        resp["chosenEffect"] = state.get("chosenEffect")
-        resp["suppressed"] = state.get("suppressed", [])
-        resp["actionLog"] = state.get("actionLog", [])
-        resp["receiptLog"] = state.get("receiptLog", [])
-        if "otlp" in state:
-            resp["otlp"] = state["otlp"]
-        # Ensure no dispatches/approvals in terminal
-        resp["dispatches"] = []
-        resp["approvals"] = []
-    else:
-        # Waiting: include pending dispatches and approvals
-        resp["dispatches"] = state.get("dispatches", [])
-        resp["approvals"] = state.get("approvals", [])
-
-    # Sanitize: never echo sensitive fields
-    return _redact_response(resp)
-
-
-def _redact_response(obj):
-    """Recursively remove any sensitive keys."""
-    SENSITIVE_KEYS = {
-        "sensitive", "accessToken", "privateNote", "authorization",
-        "doNotExport", "transcript", "prompt", "prompts",
-    }
-    if isinstance(obj, dict):
-        return {
-            k: _redact_response(v)
-            for k, v in obj.items()
-            if k not in SENSITIVE_KEYS
-        }
-    if isinstance(obj, list):
-        return [_redact_response(i) for i in obj]
-    return obj
-
-
-# ---------------------------------------------------------------------------
-# Health check
+# Health / debug
 # ---------------------------------------------------------------------------
 
 @app.get("/")
-async def health():
+async def root():
     return {"status": "ok", "service": "incident-response-agent"}
 
-
 @app.get("/health")
-async def healthz():
+async def health():
     return {"status": "ok"}
-
 
 @app.get("/debug/models")
 async def list_models():
-    """Debug endpoint to list available Gemini models."""
     if not GEMINI_API_KEY:
         return {"error": "GEMINI_API_KEY not set"}
     try:
-        models = [m.name for m in genai.list_models()
-                  if "generateContent" in m.supported_generation_methods]
-        return {"available_models": models}
+        return {"models": [m.name for m in genai.list_models()
+                           if "generateContent" in m.supported_generation_methods]}
     except Exception as e:
         return {"error": str(e)}
-
